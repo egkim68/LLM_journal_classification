@@ -1,0 +1,240 @@
+"""
+LLM Journal Classification for Library and Information Science Journals
+Using DeepSeek Chat to classify LIS journals based on scope statements
+
+Author: Eungi Kim
+Date: October 4, 2025
+Contact: eungikim68@daum.net
+
+DATA SOURCE:
+Input data collected from Scimago Journal & Country Rank (https://www.scimagojr.com/)
+- Filter: Social Sciences > Library and Information Sciences
+- Required CSV columns: Title, Scope
+- Scope statements manually collected from each journal's Scimago detail page
+
+Due to copyright considerations, input data is not redistributed. 
+Reconstruct by following the procedure above.
+"""
+
+import pandas as pd
+import re
+import time
+import chardet
+import os
+from openai import OpenAI
+
+# Configuration
+INPUT_FILE = 'data/lis_journals_info.csv'
+OUTPUT_FILE = 'data/journal_classifications_deepseek.csv'
+MODEL_NAME = "deepseek-chat"
+
+api_key = "YOUR_API_KEY_HERE"  # Replace with your key
+client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+
+def get_deepseek_response(prompt, system_prompt, max_retries=3, retry_delay=3):
+    """Get response from DeepSeek API with error handling and retries"""
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=1024
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"Error: {e}. Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                print(f"Failed after {max_retries} attempts: {e}")
+                return "Error: Could not generate response."
+
+def create_classification_prompt(journal_title, scope_statement):
+    """Create prompt with 85 ASJC categories that co-occur with LIS in Scopus"""
+    
+    categories = [
+        "1. Accounting", "2. Agricultural and Biological Sciences (miscellaneous)", "3. Analysis",
+        "4. Anthropology", "5. Applied Mathematics", "6. Archeology (arts and humanities)",
+        "7. Artificial Intelligence", "8. Arts and Humanities (miscellaneous)", 
+        "9. Biochemistry, Genetics and Molecular Biology (miscellaneous)", "10. Bioengineering",
+        "11. Business and International Management", "12. Business, Management and Accounting (miscellaneous)",
+        "13. Chemical Engineering (miscellaneous)", "14. Chemistry (miscellaneous)", "15. Communication",
+        "16. Computational Theory and Mathematics", "17. Computer Graphics and Computer-Aided Design",
+        "18. Computer Networks and Communications", "19. Computer Science (miscellaneous)",
+        "20. Computer Science Applications", "21. Conservation", "22. Cultural Studies",
+        "23. Decision Sciences (miscellaneous)", "24. Dentistry (miscellaneous)", "25. Development",
+        "26. E-learning", "27. Economics and Econometrics", "28. Education",
+        "29. Electrical and Electronic Engineering", "30. Energy Engineering and Power Technology",
+        "31. Engineering (miscellaneous)", "32. Fuel Technology", "33. Gender Studies",
+        "34. Geography, Planning and Development", "35. Hardware and Architecture",
+        "36. Health (social science)", "37. Health Informatics", "38. Health Information Management",
+        "39. Health Policy", "40. Health Professions (miscellaneous)", "41. History",
+        "42. History and Philosophy of Science", "43. Human-Computer Interaction",
+        "44. Human Factors and Ergonomics", "45. Immunology and Microbiology (miscellaneous)",
+        "46. Industrial and Manufacturing Engineering", "47. Information Systems",
+        "48. Information Systems and Management", "49. Law", "50. Library and Information Sciences",
+        "51. Linguistics and Language", "52. Literature and Literary Theory",
+        "53. Management Information Systems", "54. Management of Technology and Innovation",
+        "55. Management Science and Operations Research", "56. Management, Monitoring, Policy and Law",
+        "57. Marketing", "58. Mathematics (miscellaneous)", "59. Media Technology",
+        "60. Medicine (miscellaneous)", "61. Modeling and Simulation", "62. Museology",
+        "63. Music", "64. Numerical Analysis", "65. Organizational Behavior and Human Resource Management",
+        "66. Pharmaceutical Science", "67. Pharmacology, Toxicology and Pharmaceutics (miscellaneous)",
+        "68. Philosophy", "69. Physical and Theoretical Chemistry", "70. Physics and Astronomy (miscellaneous)",
+        "71. Political Science and International Relations", "72. Process Chemistry and Technology",
+        "73. Psychology (miscellaneous)", "74. Public Administration",
+        "75. Public Health, Environmental and Occupational Health",
+        "76. Renewable Energy, Sustainability and the Environment", "77. Safety Research",
+        "78. Social Sciences (miscellaneous)", "79. Sociology and Political Science", "80. Software",
+        "81. Statistical and Nonlinear Physics", "82. Statistics and Probability",
+        "83. Statistics, Probability and Uncertainty", "84. Strategy and Management",
+        "85. Visual Arts and Performing Arts"
+    ]
+    
+    categories_text = "\n".join(categories)
+    
+    prompt = f"""Journal Title: {journal_title}
+Scope Statement: {scope_statement}
+
+Available categories:
+{categories_text}
+
+Select the category that best represents the journal's primary discipline. If one category does not adequately capture the journal's scope, select additional relevant categories.
+
+Respond with ONLY the category number(s) separated by semicolons.
+Examples: 50 (one category), 47; 50 (two categories), 28; 47; 50 (three categories)
+
+Note: Across this domain, journals have a mean of 2.63 category assignments."""
+
+    return prompt
+
+def create_system_prompt():
+    """Create the system prompt for the classification task"""
+    return """You are classifying academic journals into subject categories. Identify the PRIMARY disciplinary focus of this journal, but more than one category is possible if one category does not adequately capture the journal's scope."""
+
+def parse_classification_response(response):
+    """Parse category numbers from response"""
+    try:
+        response = response.strip()
+        numbers = re.findall(r'\b\d+\b', response)
+        
+        if numbers:
+            category_numbers = []
+            for num in numbers:
+                num_int = int(num)
+                if 1 <= num_int <= 85:
+                    category_numbers.append(num_int)
+            
+            if category_numbers:
+                category_numbers = sorted(category_numbers)
+                return "; ".join(map(str, category_numbers))
+        
+        return "No categories identified"
+        
+    except Exception as e:
+        print(f"Error parsing response: {e}")
+        return "Parse error"
+
+def load_journal_data():
+    """Load journal data with encoding detection"""
+    try:
+        print(f"Loading journal data from {INPUT_FILE}")
+        
+        encodings_to_try = ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252']
+        
+        for encoding in encodings_to_try:
+            try:
+                journal_df = pd.read_csv(INPUT_FILE, encoding=encoding)
+                print(f"Successfully loaded with {encoding} encoding")
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            with open(INPUT_FILE, 'rb') as f:
+                raw_data = f.read()
+                detected = chardet.detect(raw_data)
+                detected_encoding = detected['encoding']
+                print(f"Auto-detected encoding: {detected_encoding}")
+                
+            journal_df = pd.read_csv(INPUT_FILE, encoding=detected_encoding)
+        
+        print(f"Successfully loaded {len(journal_df)} journals for classification")
+        return journal_df
+        
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return None
+
+def main():
+    """Main processing function"""
+    print("Starting LLM Journal Classification with DeepSeek")
+    print(f"Using model: {MODEL_NAME}")
+    
+    df = load_journal_data()
+    if df is None:
+        return
+    
+    df['llm_classification'] = None
+    df['classification_timestamp'] = None
+    
+    # Resume from checkpoint
+    start_index = 0
+    if os.path.exists(OUTPUT_FILE):
+        try:
+            existing_df = pd.read_csv(OUTPUT_FILE)
+            if 'llm_classification' in existing_df.columns:
+                completed_rows = existing_df['llm_classification'].notna().sum()
+                if completed_rows > 0:
+                    print(f"Found existing progress: {completed_rows} records already processed")
+                    start_index = completed_rows
+                    for i in range(min(start_index, len(df))):
+                        if i < len(existing_df):
+                            df.at[i, 'llm_classification'] = existing_df.at[i, 'llm_classification']
+                            df.at[i, 'classification_timestamp'] = existing_df.at[i, 'classification_timestamp']
+        except Exception as e:
+            print(f"Could not read existing output file: {e}")
+    
+    df.to_csv(OUTPUT_FILE, index=False)
+    print(f"Initialized output file: {OUTPUT_FILE}")
+    
+    system_prompt = create_system_prompt()
+    
+    # Process journals
+    for i in range(start_index, len(df)):
+        row = df.iloc[i]
+        journal_title = row['Title']
+        scope_statement = row['Scope']
+        
+        print(f"\nProcessing journal {i+1}/{len(df)}: {journal_title}")
+        
+        if pd.isna(scope_statement) or str(scope_statement).strip() == '':
+            print(f"Skipping - No scope statement available")
+            df.at[i, 'llm_classification'] = "No scope statement"
+            continue
+        
+        prompt = create_classification_prompt(journal_title, scope_statement)
+        response = get_deepseek_response(prompt, system_prompt)
+        classification = parse_classification_response(response)
+        
+        df.at[i, 'llm_classification'] = classification
+        df.at[i, 'classification_timestamp'] = pd.Timestamp.now().isoformat()
+        
+        print(f"Classification: {classification}")
+        
+        if (i + 1) % 10 == 0 or i == len(df) - 1:
+            df.to_csv(OUTPUT_FILE, index=False)
+            print(f"Progress saved through journal {i+1}")
+        
+        time.sleep(2)
+    
+    print(f"\nClassification complete! Results saved to {OUTPUT_FILE}")
+    total_classified = df['llm_classification'].notna().sum()
+    print(f"Successfully classified: {total_classified}/{len(df)} journals")
+
+if __name__ == "__main__":
+    main()
